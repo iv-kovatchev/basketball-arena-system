@@ -1,52 +1,107 @@
 package org.backend;
 
+import org.backend.config.ArenaConfigurer;
+import org.backend.config.GroupConfigurer;
 import org.backend.models.Arena;
 import org.backend.models.FanGroup;
 import org.backend.models.SeatCategory;
+import org.backend.processor.GateProcessor;
+import org.backend.repository.ArenaRepository;
+import org.backend.repository.IArenaRepository;
+import org.backend.service.ISeatAllocationService;
+import org.backend.service.SeatAllocationService;
+import org.backend.util.ConsoleFormatter;
 
-import java.util.EnumMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Scanner;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Main {
+    // Number of entrance gates (threads)
+    private static final int GATE_COUNT = 4;
+    private static final AtomicInteger successCounter = new AtomicInteger(0);
+    private static final AtomicInteger rejectedCounter = new AtomicInteger(0);
+
     public static void main(String[] args) {
-        // Тест 1: Builder pattern
-        Arena arena = new Arena.Builder()
-                .withVIP(100)
-                .withCourtside(80)
-                .withLower(200)
-                .withUpper(300)
-                .build();
 
-        System.out.println(arena);
-        // Arena Capacity:
-        //   VIP        : 100 seats
-        //   Courtside  : 80 seats
-        //   Lower      : 200 seats
-        //   Upper      : 300 seats
-        //   TOTAL      : 680 seats
+        try (Scanner scanner = new Scanner(System.in)) {
+            // Print header
+            ConsoleFormatter.printHeader();
 
-        // Тест 2: Getters
-        System.out.println("\nVIP capacity: " + arena.getCapacity(SeatCategory.VIP)); // 100
-        System.out.println("Total: " + arena.getTotalCapacity()); // 680
+            // Configure arena and groups
+            Arena arena = ArenaConfigurer.configureUserInput(scanner);
+            ConsoleFormatter.printArenaCapacity(arena.getCapacityMap());
 
-        // Тест 3: Has category
-        System.out.println("\nHas VIP? " + arena.hasCategory(SeatCategory.VIP)); // true
+            List<FanGroup> groups = GroupConfigurer.configureFromUserInput(scanner);
 
-        // Тест 4: Get capacity map (immutable)
-        Map<SeatCategory, Integer> capacityMap = arena.getCapacityMap();
-        try {
-            capacityMap.put(SeatCategory.VIP, 999); // Ще хвърли UnsupportedOperationException
-        } catch (UnsupportedOperationException e) {
-            System.out.println("\n✓ Map is immutable - cannot modify!"); // ✓
+            // Initialize dependencies
+            IArenaRepository repository = new ArenaRepository(arena);
+            ISeatAllocationService service = new SeatAllocationService(repository);
+
+            // Process groups
+            ConsoleFormatter.printSection("PROCESSING GROUPS THROUGH GATES");
+            processGroups(groups, service);
+
+            // Print final report
+            printFinalReport(repository, arena);
         }
+    }
 
-        // Тест 5: Invalid capacity
+    /**
+     * Processes fan groups using thread pool.
+     */
+    private static void processGroups(List<FanGroup> groups,
+                                      ISeatAllocationService service) {
+
+        ExecutorService executor = Executors.newFixedThreadPool(GATE_COUNT);
+
         try {
-            Map<SeatCategory, Integer> invalid = new EnumMap<>(SeatCategory.class);
-            invalid.put(SeatCategory.VIP, -50);
-            Arena badArena = new Arena(invalid);
-        } catch (IllegalArgumentException e) {
-            System.out.println("\n" + e.getMessage());
+            AtomicInteger gateCounter = new AtomicInteger(1);
+
+            for (FanGroup group : groups) {
+                int gateId = ((gateCounter.getAndIncrement() - 1) % GATE_COUNT) + 1;
+
+                executor.submit(() -> {
+                    GateProcessor.processGroup(group, service, gateId);
+                    successCounter.incrementAndGet();
+                });
+            }
+
+            executor.shutdown();
+            System.out.println("\n>>> Waiting for all gates to finish...\n");
+
+            boolean finished = executor.awaitTermination(5, TimeUnit.MINUTES);
+
+            if (!finished) {
+                System.err.println("WARNING: Processing timeout!");
+                executor.shutdownNow();
+            }
+
+        } catch (InterruptedException e) {
+            System.err.println("Processing interrupted: " + e.getMessage());
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * Prints final statistics report.
+     */
+    private static void printFinalReport(IArenaRepository repository, Arena arena) {
+        Map<SeatCategory, Integer> currentState = repository.getCurrentState();
+        Map<SeatCategory, Integer> totalCapacity = arena.getCapacityMap();
+
+        ConsoleFormatter.printFinalReport(
+                currentState,
+                totalCapacity,
+                successCounter.get(),
+                rejectedCounter.get()
+        );
+
+        System.out.println("\nAll entrance gates closed.");
     }
 }
